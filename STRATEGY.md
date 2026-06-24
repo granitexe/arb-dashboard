@@ -6,8 +6,16 @@ This tool only PRODUCES SIGNALS AND CODE. It does NOT execute trades, hold keys,
 or touch a wallet. Execution happens on a separate machine, gated by a human.
 
 ## Data sources
-- Velo API: funding_rate, open_interest, premium, 3m_basis_ann (BTC/ETH), liquidations.
-- Hyperliquid SDK (github.com/hyperliquid-dex): venue + on-chain funding.
+- Loris Tools API (api.loris.tools/funding): cross-venue funding_rate (8h-normalized bps) and
+  open-interest rankings. Auth via `X-Api-Key` read from the LORIS_API_KEY env var. Free tier
+  returns BTC/ETH only; full multi-venue coverage needs a paid key. Poll <= once per 60s.
+- Public exchange REST (Binance, Bybit, OKX): spot + perp prices for basis and spot-vs-perp
+  lead/lag. Keyless.
+- Hyperliquid SDK (github.com/hyperliquid-dex): venue + on-chain funding, notional open
+  interest, premium, and spot circulating/total supply. Keyless.
+- CoinGecko API: market cap, circulating + total supply (OI / market-cap distortion). Keyless.
+- DeFiLlama API: token unlock / emissions schedules (upcoming-unlock signal). Keyless via the
+  emissions datasets CDN.
 - aggr.trade: spot-vs-perp flow (dislocation spotting).
 - Evaluate and report on: hl.eco, kiyotaka.ai, hydromancer.xyz (treat as unvetted).
 

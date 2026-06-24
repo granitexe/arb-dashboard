@@ -1,0 +1,26 @@
+{
+  "symbols": ["BTC", "ETH", "SOL"],
+  "exchanges": {
+    "exchange_names": [
+      {"name": "binance", "display": "BINANCE"},
+      {"name": "bybit", "display": "BYBIT"},
+      {"name": "hyperliquid", "display": "HYPERLIQUID"}
+    ],
+    "exchanges": ["binance", "bybit", "hyperliquid"]
+  },
+  "funding_rates": {
+    "binance": {"BTC": 10.0, "ETH": -15.0, "SOL": 25.0},
+    "bybit": {"BTC": 12.0, "ETH": -10.0},
+    "hyperliquid": {"BTC": 8.0}
+  },
+  "funding_rates_raw": {
+    "binance": {"BTC": "0.00100000"}
+  },
+  "funding_intervals": {
+    "binance": {"BTC": 8, "ETH": 8, "SOL": 8},
+    "hyperliquid": {"BTC": 1}
+  },
+  "oi_rankings": {"BTC": "1", "ETH": "2", "SOL": "3", "XYZ": "500+"},
+  "default_oi_rank": "500+",
+  "timestamp": "2026-06-08 06:00:00"
+}
