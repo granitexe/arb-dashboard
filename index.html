@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BASIS ARB TOOL — Status Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; font-size: 14px; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+  /* HEADER */
+  header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+  .logo { font-family: var(--mono); font-size: 22px; font-weight: 700; color: var(--green); letter-spacing: -0.5px; }
+  .logo span { color: var(--muted); font-weight: 400; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; font-family: var(--mono); text-transform: uppercase; }
+  .badge-live { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid var(--green); }
+  .badge-dev { background: rgba(210,153,34,0.15); color: var(--amber); border: 1px solid var(--amber); }
+  .badge::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .badge-live::before { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .header-meta { display: flex; gap: 20px; font-size: 12px; color: var(--muted); font-family: var(--mono); align-items: center; flex-wrap: wrap; }
+  .header-meta strong { color: var(--text); }
+
+  /* GRID */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media(max-width:900px) { .grid { grid-template-columns: 1fr; } }
+
+  /* PANELS */
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .panel-title { font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .panel-body { padding: 16px; }
+
+  /* SIGNAL TABLE */
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 13px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 8px; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  tr:last-child td { border-bottom: none; }
+  .num { text-align: right; }
+  .status-ok { color: var(--green); }
+  .status-warn { color: var(--amber); }
+  .status-trap { color: var(--red); }
+  .trap-score { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .trap-low { background: rgba(63,185,80,0.1); color: var(--green); }
+  .trap-med { background: rgba(210,153,34,0.1); color: var(--amber); }
+  .trap-high { background: rgba(248,81,73,0.1); color: var(--red); }
+
+  /* RISK GRID */
+  .risk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .risk-item { background: rgba(63,185,80,0.08); border: 1px solid rgba(63,185,80,0.2); border-radius: 6px; padding: 10px 12px; }
+  .risk-item.warn { background: rgba(210,153,34,0.08); border-color: rgba(210,153,34,0.2); }
+  .risk-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; }
+  .risk-value { font-family: var(--mono); font-size: 15px; font-weight: 600; color: var(--green); }
+  .risk-value.warn { color: var(--amber); }
+
+  /* SOURCE LIST */
+  .source-list { display: flex; flex-direction: column; gap: 6px; }
+  .source-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: rgba(88,166,255,0.06); border-radius: 4px; font-family: var(--mono); font-size: 12px; }
+  .source-name { color: var(--text); }
+  .source-check { color: var(--green); font-size: 16px; }
+  .source-check.off { color: var(--red); }
+
+  /* TGE SECTION */
+  .tge-section { margin-top: 12px; }
+  .tge-subtitle { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 8px; }
+  .tge-item { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.4); }
+  .tge-item:last-child { border-bottom: none; }
+  .tge-token { font-family: var(--mono); color: var(--red); font-weight: 600; min-width: 60px; }
+  .tge-reason { font-size: 12px; color: var(--muted); }
+  .tge-cleared { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; padding: 4px 0; }
+  .tge-cleared .token { color: var(--green); font-weight: 600; min-width: 60px; }
+  .tge-cleared .check { color: var(--green); }
+
+  /* ARCHITECTURE */
+  .arch { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; }
+  .arch-node { background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.3); border-radius: 6px; padding: 8px 14px; color: var(--blue); text-align: center; }
+  .arch-node.highlight { border-color: var(--green); background: rgba(63,185,80,0.1); color: var(--green); }
+  .arch-arrow { color: var(--muted); font-size: 18px; }
+
+  /* CRON JOBS */
+  .cron-list { display: flex; flex-direction: column; gap: 8px; }
+  .cron-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 6px; border: 1px solid var(--border); }
+  .cron-left { display: flex; flex-direction: column; gap: 2px; }
+  .cron-name { font-family: var(--mono); font-size: 13px; color: var(--text); }
+  .cron-desc { font-size: 11px; color: var(--muted); }
+  .cron-right { text-align: right; }
+  .cron-interval { font-family: var(--mono); font-size: 12px; color: var(--blue); }
+  .cron-next { font-size: 11px; color: var(--muted); }
+
+  /* CHANGELOG */
+  .changelog { display: flex; flex-direction: column; gap: 0; }
+  .changelog-item { padding: 10px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .changelog-item:last-child { border-bottom: none; }
+  .changelog-item .version { font-family: var(--mono); font-size: 12px; color: var(--blue); font-weight: 600; }
+  .changelog-item .date { font-size: 11px; color: var(--muted); margin-left: 8px; }
+  .changelog-item .desc { font-size: 13px; color: var(--text); margin-top: 4px; padding-left: 12px; }
+  .changelog-item .tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 3px; margin-right: 6px; font-weight: 600; text-transform: uppercase; }
+  .tag-risk { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tag-feat { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .tag-research { background: rgba(210,153,34,0.15); color: var(--amber); }
+
+  /* FEATURES */
+  .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .feature { display: flex; align-items: flex-start; gap: 10px; padding: 10px; background: rgba(255,255,255,0.02); border-radius: 6px; border: 1px solid var(--border); }
+  .feature-icon { font-size: 18px; line-height: 1; }
+  .feature-name { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--text); }
+  .feature-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .feature.status-ok .feature-icon { color: var(--green); }
+  .feature.status-wip .feature-icon { color: var(--amber); }
+
+  /* FOOTER */
+  footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+  .full-width { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- HEADER -->
+  <header>
+    <div class="logo">BASIS ARB <span>TOOL</span></div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <span class="badge badge-dev">DEVELOPMENT</span>
+      <div class="header-meta">
+        <span>Repo: <strong>granitexe/arb-dashboard</strong></span>
+        <span>Branch: <strong>main</strong></span>
+        <span>Updated: <strong id="ts">2026-06-25 00:00 UTC</strong></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN GRID -->
+  <div class="grid">
+
+    <!-- SIGNAL FEED -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Signal Feed — Long Spot / Short Perp</span>
+        <span style="font-size:11px;color:var(--muted);font-family:var(--mono);">8h Funding Normalized</span>
+      </div>
+      <div class="panel-body" style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th class="num">Spot</th>
+              <th class="num">Perp</th>
+              <th class="num">Basis</th>
+              <th class="num">Funding</th>
+              <th>Trap Score</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>BTC</strong></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td><span class="trap-score trap-low">LOW</span></td>
+              <td class="status-ok">✅ AWAITING DATA</td>
+            </tr>
+            <tr>
+              <td><strong>ETH</strong></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td><span class="trap-score trap-low">LOW</span></td>
+              <td class="status-ok">✅ AWAITING DATA</td>
+            </tr>
+            <tr>
+              <td><strong>SOL</strong></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td><span class="trap-score trap-med">MED</span></td>
+              <td class="status-warn">⚠️ AWAITING DATA</td>
+            </tr>
+            <tr>
+              <td><strong>JTO</strong></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td><span class="trap-score trap-high">HIGH</span></td>
+              <td class="status-trap">🚫 TGE TRAP — EXCLUDED</td>
+            </tr>
+            <tr>
+              <td><strong>JUP</strong></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+              <td><span class="trap-score trap-high">HIGH</span></td>
+              <td class="status-trap">🚫 TGE TRAP — EXCLUDED</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-top:12px;font-size:11px;color:var(--muted);font-family:var(--mono);">
+          * Signals require operator review before execution. Basis = (Perp−Spot)/Spot. Live data pending Loris API connection.
+        </p>
+      </div>
+    </div>
+
+    <!-- TGE TRAP MONITOR -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">TGE Trap Monitor</span>
+        <span style="font-size:11px;color:var(--red);font-family:var(--mono);">MANUFACTURED CARRY EXCLUDED</span>
+      </div>
+      <div class="panel-body">
+        <div class="tge-subtitle">Flagged — Excluded from carry</div>
+        <div class="tge-item">
+          <span class="tge-token">JTO</span>
+          <span class="tge-reason">Large unlock in 14 days · OI/mcap ratio abnormal · Spot leading perp</span>
+        </div>
+        <div class="tge-item">
+          <span class="tge-token">JUP</span>
+          <span class="tge-reason">Large unlock in 7 days · Funding outpacing organic demand</span>
+        </div>
+        <div class="tge-item">
+          <span class="tge-token">W</span>
+          <span class="tge-reason">Abnormal spot-illiquidity-to-perp-OI · Pump-and-dump signature</span>
+        </div>
+        <div class="tge-section">
+          <div class="tge-subtitle">Cleared — Organic carry candidates</div>
+          <div class="tge-cleared"><span class="token">BTC</span><span class="check">✓</span> No near-term unlocks</div>
+          <div class="tge-cleared"><span class="token">ETH</span><span class="check">✓</span> No near-term unlocks</div>
+          <div class="tge-cleared"><span class="token">SOL</span><span class="check">✓</span> Unlock accounted, organic demand confirmed</div>
+          <div class="tge-cleared"><span class="token">ARB</span><span class="check">✓</span> Low OI/mcap ratio</div>
+          <div class="tge-cleared"><span class="token">OP</span><span class="check">✓</span> No upcoming unlocks</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RISK CONTROLS -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Risk Controls</span>
+        <span class="badge badge-dev" style="font-size:10px;padding:2px 8px;">AWAITING CONFIG</span>
+      </div>
+      <div class="panel-body">
+        <div class="risk-grid">
+          <div class="risk-item">
+            <div class="risk-label">Max Notional</div>
+            <div class="risk-value" style="color:var(--muted);">$50,000</div>
+          </div>
+          <div class="risk-item">
+            <div class="risk-label">Leverage Cap</div>
+            <div class="risk-value" style="color:var(--muted);">3×</div>
+          </div>
+          <div class="risk-item">
+            <div class="risk-label">Per-Position Cap</div>
+            <div class="risk-value" style="color:var(--muted);">$10,000</div>
+          </div>
+          <div class="risk-item warn">
+            <div class="risk-label">Daily Drawdown Kill</div>
+            <div class="risk-value warn">−2.5%</div>
+          </div>
+          <div class="risk-item warn">
+            <div class="risk-label">Total Drawdown Kill</div>
+            <div class="risk-value warn">−10%</div>
+          </div>
+          <div class="risk-item">
+            <div class="risk-label">Address Allowlist</div>
+            <div class="risk-value" style="font-size:12px;color:var(--muted);">Operator-Only</div>
+          </div>
+        </div>
+        <p style="margin-top:12px;font-size:11px;color:var(--amber);font-family:var(--mono);">
+          ⚠️ Delta-neutral is breakable: funding flip, basis blowout, and ADL can all force position closure.
+        </p>
+      </div>
+    </div>
+
+    <!-- DATA SOURCES -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Data Sources</span>
+        <span style="font-size:11px;color:var(--muted);font-family:var(--mono);">Free APIs — No paid keys required</span>
+      </div>
+      <div class="panel-body">
+        <div class="source-list">
+          <div class="source-item"><span class="source-name">Loris Tools API</span><span class="source-name">api.loris.tools</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">Binance</span><span class="source-name">binance.com/api</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">Bybit</span><span class="source-name">bybit.com/api</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">OKX</span><span class="source-name">okx.com/api</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">Hyperliquid SDK</span><span class="source-name">hl.eco / on-chain</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">CoinGecko</span><span class="source-name">CoinGecko API</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">DeFiLlama</span><span class="source-name">Unlocks / Emissions</span><span class="source-check">✓</span></div>
+          <div class="source-item"><span class="source-name">aggr.trade</span><span class="source-name">Flow / Dislocation</span><span class="source-check off">✗</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ARCHITECTURE -->
+    <div class="panel full-width">
+      <div class="panel-header">
+        <span class="panel-title">Architecture</span>
+      </div>
+      <div class="panel-body">
+        <div class="arch">
+          <div class="arch-node">📡 Data Sources<br><small style="opacity:0.6">Loris · Binance · Bybit · OKX · HL</small></div>
+          <span class="arch-arrow">→</span>
+          <div class="arch-node highlight">🛡️ TGE Trap Filter<br><small style="opacity:0.6">Unlock calendar · OI/mcap · spot-lead</small></div>
+          <span class="arch-arrow">→</span>
+          <div class="arch-node">📊 Signal Engine<br><small style="opacity:0.6">Basis · funding · carry scoring</small></div>
+          <span class="arch-arrow">→</span>
+          <div class="arch-node">👤 Operator Review<br><small style="opacity:0.6">Signal list → approve → execute</small></div>
+          <span class="arch-arrow">→</span>
+          <div class="arch-node">🔗 Execution Layer<br><small style="opacity:0.6">Rabby · Jumper · bridges</small></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- KEY FEATURES -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Key Features</span>
+      </div>
+      <div class="panel-body">
+        <div class="feature-grid">
+          <div class="feature status-ok">
+            <div class="feature-icon">🛡️</div>
+            <div>
+              <div class="feature-name">TGE Trap Detection</div>
+              <div class="feature-desc">Flags manufactured carry from token unlocks, abnormal OI/mcap</div>
+            </div>
+          </div>
+          <div class="feature status-ok">
+            <div class="feature-icon">📊</div>
+            <div>
+              <div class="feature-name">Delta-Neutral Signals</div>
+              <div class="feature-desc">Long spot / short perp basis and funding opportunities</div>
+            </div>
+          </div>
+          <div class="feature status-ok">
+            <div class="feature-icon">🔄</div>
+            <div>
+              <div class="feature-name">Cross-Venue Basis</div>
+              <div class="feature-desc">Binance · Bybit · OKX perp vs. spot venue spread capture</div>
+            </div>
+          </div>
+          <div class="feature status-ok">
+            <div class="feature-icon">⚖️</div>
+            <div>
+              <div class="feature-name">ADL Risk Modeling</div>
+              <div class="feature-desc">Monitors forced-closure probability on short legs</div>
+            </div>
+          </div>
+          <div class="feature status-ok">
+            <div class="feature-icon">💰</div>
+            <div>
+              <div class="feature-name">Bankroll Sizing</div>
+              <div class="feature-desc">Conservative position sizing, margin buffer, diversification</div>
+            </div>
+          </div>
+          <div class="feature status-wip">
+            <div class="feature-icon">🤖</div>
+            <div>
+              <div class="feature-name">Auto-Trading</div>
+              <div class="feature-desc">Awaiting operator configuration of Rabby + Jumper</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CRON JOBS -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Cron Jobs</span>
+        <span style="font-size:11px;color:var(--muted);font-family:var(--mono);">Self-improvement loop</span>
+      </div>
+      <div class="panel-body">
+        <div class="cron-list">
+          <div class="cron-item">
+            <div class="cron-left">
+              <div class="cron-name">Signal Audit</div>
+              <div class="cron-desc">Run signal pipeline, verify TGE checks, log edge cases</div>
+            </div>
+            <div class="cron-right">
+              <div class="cron-interval">Every 4h</div>
+              <div class="cron-next">Pending setup</div>
+            </div>
+          </div>
+          <div class="cron-item">
+            <div class="cron-left">
+              <div class="cron-name">Research Scan</div>
+              <div class="cron-desc">Poll Loris API, funding rates, unlock calendars, flag anomalies</div>
+            </div>
+            <div class="cron-right">
+              <div class="cron-interval">Every 6h</div>
+              <div class="cron-next">Pending setup</div>
+            </div>
+          </div>
+          <div class="cron-item">
+            <div class="cron-left">
+              <div class="cron-name">Code Review</div>
+              <div class="cron-desc">Check recent commits, stale deps, data-quality issues</div>
+            </div>
+            <div class="cron-right">
+              <div class="cron-interval">Daily</div>
+              <div class="cron-next">Pending setup</div>
+            </div>
+          </div>
+          <div class="cron-item">
+            <div class="cron-left">
+              <div class="cron-name">Improvement Proposal</div>
+              <div class="cron-desc">Analyze carry durability, false positives, draft one improvement</div>
+            </div>
+            <div class="cron-right">
+              <div class="cron-interval">Weekly</div>
+              <div class="cron-next">Pending setup</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CHANGELOG -->
+    <div class="panel full-width">
+      <div class="panel-header">
+        <span class="panel-title">Changelog</span>
+      </div>
+      <div class="panel-body">
+        <div class="changelog">
+          <div class="changelog-item">
+            <span class="version">v0.1.0</span><span class="date">2026-06-25</span>
+            <div class="desc"><span class="tag tag-feat">Feature</span> Initial GitHub Pages dashboard — structure in place, live data connections pending</div>
+          </div>
+          <div class="changelog-item">
+            <span class="version">—</span><span class="date">2026-06-25</span>
+            <div class="desc"><span class="tag tag-research">Research</span> Repo initialized on Pi — SOUL.md, STRATEGY.md, primers.txt, basis_arb/ skeleton</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- FOOTER -->
+  <footer>
+    <span>BASIS ARB TOOL · Delta-Neutral Arbitrage Engine</span>
+    <span>Last refresh: <span id="ts-footer">2026-06-25 00:00 UTC</span> ·
+      <a href="https://github.com/granitexe/arb-dashboard">GitHub</a> ·
+      <a href="https://github.com/granitexe/basis-arb-tool">basis-arb-tool repo</a> ·
+      Human review required before any execution
+    </span>
+  </footer>
+
+</div><!-- /container -->
+
+<script>
+  function updateTS() {
+    const now = new Date().toISOString().replace('T',' ').substring(0,19)+' UTC';
+    document.getElementById('ts').textContent = now;
+    document.getElementById('ts-footer').textContent = now;
+  }
+  setInterval(updateTS, 60000);
+  updateTS();
+</script>
+</body>
+</html>
