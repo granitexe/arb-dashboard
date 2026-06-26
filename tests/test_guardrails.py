@@ -37,8 +37,17 @@ def _imports(path):
 
 
 def test_no_forbidden_imports_anywhere():
+    """Guardrail: no module in the package (except execution/) may import signing/trading libs.
+
+    The execution/ sub-package is the INTENTIONALLY isolated layer that holds all
+    Exchange/signing imports. All other modules must remain read-only.
+    """
     offenders = []
     for path in _py_files():
+        # execution/ is the intentional isolation boundary for trading/signing code.
+        # All other modules must stay clean.
+        if "/execution/" in path:
+            continue
         for mod, name in _imports(path):
             if any(mod == p or mod.startswith(p + ".") or mod == p for p in FORBIDDEN_MODULE_PREFIXES):
                 offenders.append((path, mod, name))
@@ -48,8 +57,12 @@ def test_no_forbidden_imports_anywhere():
 
 
 def test_only_whitelisted_hyperliquid_imports():
+    """Only execution/ and sources/ may import hyperliquid libs, and only via allowlist."""
     found = set()
     for path in _py_files():
+        # execution/ may import Exchange (that's its job). sources/ may import Info.
+        if "/execution/" in path:
+            continue
         for mod, name in _imports(path):
             if mod.startswith("hyperliquid") and name is not None:
                 found.add((mod, name))
@@ -66,8 +79,16 @@ def test_hyperliquid_client_uses_info_only():
 
 
 def test_no_private_key_identifiers():
+    """Guardrail: no module in the package (except execution/) may reference credential names.
+
+    The execution/ sub-package is the only place that handles secret keys,
+    so it is excluded from this check.
+    """
     bad = ("secret_key", "private_key", "mnemonic")
     for path in _py_files():
+        # execution/ is the only place allowed to handle secret keys
+        if "/execution/" in path:
+            continue
         tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}

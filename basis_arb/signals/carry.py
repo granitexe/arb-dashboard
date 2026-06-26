@@ -57,7 +57,14 @@ def estimate_carry(raw: CoinRawInput, cfg: BasisArbConfig) -> CarryEstimate:
 
     total = (funding_apr or 0.0) + (basis_apr or 0.0)
 
-    # 4) Diagnostic best venue (highest complete funding+basis), not used for ranking.
+    # --- Execution-fee floor: net carry after round-trip fees -----------------
+    # Annualize as: bps/10k * periods_per_day * days_per_year.
+    # e.g. 8 bps round-trip at 3 funding periods/day: 8/10000 * 3 * 365 = 8.76% APR.
+    fee_annual = (cfg.execution_fee_bps_roundtrip / 10_000.0) \
+        * cfg.funding_periods_per_day * cfg.days_per_year
+    net = total - fee_annual if total != 0.0 else None
+
+    # --- Diagnostic best venue (highest complete funding+basis), not used for ranking.
     selected_short = None
     best = None
     for v in venue_funding:
@@ -71,6 +78,10 @@ def estimate_carry(raw: CoinRawInput, cfg: BasisArbConfig) -> CarryEstimate:
     )
 
     caveats = _base_caveats(raw, cfg)
+    caveats.append(
+        f"execution_floor: {cfg.execution_fee_bps_roundtrip:.0f} bps round-trip deducted "
+        f"(~{fee_annual*100:.1f}% APR); net carry = {net*100:.1f}% APR after fees"
+    )
     if f8 is not None and abs(f8) < cfg.funding_flip_near_zero_8h:
         caveats.append("funding_flip_risk: funding near zero; sign can flip and you start paying")
     hl_ctx = next((vf for vf in raw.funding_by_venue.values() if vf.context_only and vf.funding_8h_decimal is not None), None)
@@ -89,6 +100,7 @@ def estimate_carry(raw: CoinRawInput, cfg: BasisArbConfig) -> CarryEstimate:
         basis_pct=basis_pct_agg,
         basis_apr=basis_apr,
         total_carry_apr=total,
+        net_carry_apr=net,
         venue_funding_aprs=venue_funding,
         venue_basis_aprs=venue_basis,
         caveats=caveats,

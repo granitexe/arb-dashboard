@@ -24,7 +24,10 @@ def build_signal(raw: CoinRawInput, carry: CarryEstimate, trap: TrapBreakdown, c
         top_reason = carry.unavailable_reason or "carry unavailable"
     else:
         status = "OK"
-        risk_adjusted = carry.total_carry_apr * (1.0 - trap.composite_score)
+        # Use net_carry_apr (post-execution-fee estimate) as the base.
+        # If net is negative the carry is likely unprofitable; flag it clearly.
+        base = carry.net_carry_apr if carry.net_carry_apr is not None else carry.total_carry_apr
+        risk_adjusted = base * (1.0 - trap.composite_score)
         top_reason = _top_reason(carry, trap)
 
     return CoinSignal(

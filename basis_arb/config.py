@@ -44,9 +44,25 @@ class BasisArbConfig:
     reason_width: int = 60
     show_excluded: bool = True
 
+    # --- execution (Hyperliquid) -------------------------------------------------
+    # These fields configure the execution layer. Secret keys are NEVER stored
+    # in config — they are read from environment variables only:
+    #   HYPERLIQUID_SECRET_KEY       — private key (0x... hex)
+    #   HYPERLIQUID_ACCOUNT_ADDRESS — optional sub-account
+    #   HYPERLIQUID_ENABLED         — "true" to enable live trading
+    #   HYPERLIQUID_SLIPPAGE_BPS    — slippage tolerance (default 5.0)
+    hyperliquid_enabled: bool = False
+    hyperliquid_slippage_bps: float = 5.0
+    hyperliquid_max_slippage_bps: float = 20.0
+
     # --- carry -----------------------------------------------------------------
     funding_periods_per_day: float = 3.0  # 8h funding -> 3/day
     days_per_year: float = 365.0
+    # Execution cost estimate for net-carry calculation.
+    # Retail CEX round-trip (spot + perp): ~8 bps.
+    # New-venue / maker-tier: ~3–4 bps.  Manual-operator (tread.fi): ~10–15 bps.
+    # Expressed as total round-trip basis points (open + close).
+    execution_fee_bps_roundtrip: float = 8.0
     basis_convergence_days: float = 30.0
     funding_aggregation: Literal["oi_weighted_median", "median"] = "oi_weighted_median"
     min_oi_weighted_venues: int = 2

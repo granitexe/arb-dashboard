@@ -41,6 +41,7 @@ def _columns(reason_width: int) -> list[_Column]:
         ("Rank", 4, lambda s: str(s.rank or "")),
         ("Coin", 10, lambda s: _trunc(s.coin, 10)),
         ("Status", 17, lambda s: s.status),
+        ("NetCarryAPR", 12, lambda s: _pct(s.carry.net_carry_apr)),
         ("RiskAdjAPR", 10, lambda s: _pct(s.risk_adjusted_apr)),
         ("CarryAPR", 9, lambda s: _pct(s.carry.total_carry_apr)),
         ("FundAPR", 9, lambda s: _pct(s.carry.funding_apr)),
@@ -97,10 +98,9 @@ def _signal_json(s: CoinSignal) -> dict:
     return {
         "rank": s.rank,
         "coin": s.coin,
-        "status": s.status,
+        "carry": to_jsonable(s.carry),
         "risk_adjusted_apr": to_jsonable(s.risk_adjusted_apr),
         "top_reason": s.top_reason,
-        "carry": to_jsonable(s.carry),
         "trap": {
             "composite_score": trap.composite_score,
             "excluded": trap.excluded,

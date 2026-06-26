@@ -139,6 +139,10 @@ class CarryEstimate:
     basis_pct: Optional[float] = None
     basis_apr: Optional[float] = None
     total_carry_apr: Optional[float] = None
+    # net_carry_apr = total_carry_apr minus execution costs (execution_fee_bps_roundtrip).
+    # Annualized as: (bps / 10_000) * days_per_year / convergence_days.
+    # A coin with negative net_carry_apr is likely unprofitable after fees.
+    net_carry_apr: Optional[float] = None
     venue_funding_aprs: dict[Venue, float] = field(default_factory=dict)
     venue_basis_aprs: dict[Venue, float] = field(default_factory=dict)
     caveats: list[str] = field(default_factory=list)
