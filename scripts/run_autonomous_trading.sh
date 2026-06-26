@@ -34,6 +34,15 @@ STATE_DIR="$PROJECT_DIR/.cron_output"
 
 mkdir -p "$STATE_DIR"
 
+# Find the venv Python so cron jobs work regardless of environment
+if [ -f "$PROJECT_DIR/.venv/bin/python3" ]; then
+    PYTHON="$PROJECT_DIR/.venv/bin/python3"
+elif command -v python3 &>/dev/null; then
+    PYTHON="python3"
+else
+    PYTHON="/usr/bin/python3"
+fi
+
 # Load .env if it exists
 if [[ -f "$HOME/.basis_arb/.env" ]]; then
     set -a
@@ -71,9 +80,7 @@ fi
 log "Running autonomous trading cycle..."
 cd "$PROJECT_DIR"
 
-source .venv/bin/activate
-
-python3 -c "
+$PYTHON -c "
 import sys
 sys.path.insert(0, '$PROJECT_DIR')
 

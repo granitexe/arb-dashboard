@@ -18,6 +18,13 @@ The script computes:
 Exit codes: 0 = OK (no issues), 1 = warnings, 2 = critical (kill-switch near)
 """
 from __future__ import annotations
+import sys, os
+# Auto-activate venv if not already activated
+if sys.prefix == sys.base_prefix:
+    venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".venv", "bin", "python3")
+    if os.path.exists(venv_python):
+        os.environ["VENV_ACTIVATED"] = "1"
+        os.execv(venv_python, [venv_python, __file__] + sys.argv[1:])
 
 import datetime
 import json
@@ -130,10 +137,15 @@ def load_journal() -> list[dict]:
     return entries
 
 
-def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[dict]]:
-    """Compute health metrics from trade journal entries."""
+def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[dict], bool]:
+    """Compute health metrics from trade journal entries.
+
+    Returns (snapshot, alerts, no_data_flag).
+    no_data_flag is True when there are no closed trades — health score is based
+    on dry-run-only history and is informational, not actionable.
+    """
     if not entries:
-        return {"score": None, "note": "No trade data available"}, []
+        return {"note": "No trade data available"}, [], True
 
     alerts = []
     total_pnl = 0.0
@@ -144,31 +156,46 @@ def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[di
     open_positions = []
     peak_equity = prev_state.get("peak_equity", 0.0)
     peak_ts = prev_state.get("peak_equity_ts")
+    bankroll = prev_state.get("bankroll_usd", 10000.0)
+    no_data = True  # flip to False once we see a real closed trade
 
     for e in entries:
+        # Schema A (preferred): executor TradeJournalEntry with pnl_usd / funding_collected_usd
         pnl = e.get("pnl_usd", 0.0) or 0.0
         funding = e.get("funding_collected_usd", 0.0) or 0.0
         status = e.get("status", "")
         exit_reason = e.get("exit_reason", "")
 
-        total_pnl += pnl
-        total_funding_collected += funding
+        # Schema B (fallback): executor raw journal — action-based, no P&L fields.
+        # Dry runs have status="dry_run" and size_executed=0. Only real "OPEN" actions
+        # with status="ok" and size_executed>0 count as live trades.
+        if status == "dry_run":
+            # No realized data yet — informational only
+            total_pnl += 0.0
+            total_funding_collected += 0.0
+        elif pnl != 0.0 or funding != 0.0 or status in ("closed", "open"):
+            # Enriched entry with P&L data present
+            no_data = False
+            total_pnl += pnl
+            total_funding_collected += funding
 
-        if status == "closed":
-            if pnl >= 0:
-                wins += 1
-            else:
-                losses += 1
-            if exit_reason == "ADL":
-                adl_forced += 1
-        elif status == "open":
-            open_positions.append(e)
+            if status == "closed":
+                no_data = False
+                if pnl >= 0:
+                    wins += 1
+                else:
+                    losses += 1
+                if exit_reason == "ADL":
+                    adl_forced += 1
+            elif status == "open":
+                no_data = False
+                open_positions.append(e)
 
     total_trades = wins + losses
     win_rate = wins / total_trades if total_trades > 0 else None
 
     # Drawdown detection
-    current_equity = prev_state.get("bankroll_usd", 0.0) + total_pnl
+    current_equity = bankroll + total_pnl
     if current_equity > peak_equity:
         peak_equity = current_equity
         peak_ts = datetime.datetime.utcnow().isoformat()
@@ -233,7 +260,7 @@ def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[di
             "note": f"Drawdown within 1% of kill-switch threshold",
         })
 
-    return snapshot, alerts
+    return snapshot, alerts, no_data
 
 
 def run() -> int:

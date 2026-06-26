@@ -16,6 +16,13 @@ Outputs:
 Exit codes: 0 = OK, 1 = findings, 2 = error
 """
 from __future__ import annotations
+import sys, os
+# Auto-activate venv if not already activated
+if sys.prefix == sys.base_prefix:
+    venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".venv", "bin", "python3")
+    if os.path.exists(venv_python):
+        os.environ["VENV_ACTIVATED"] = "1"
+        os.execv(venv_python, [venv_python, __file__] + sys.argv[1:])
 
 import datetime
 import json

@@ -22,6 +22,13 @@ NEW JOB CRITERIA — a job should be added if:
 Exit codes: 0 = evaluation complete, 1 = changes recommended, 2 = error
 """
 from __future__ import annotations
+import sys, os
+# Auto-activate venv if not already activated
+if sys.prefix == sys.base_prefix:
+    venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".venv", "bin", "python3")
+    if os.path.exists(venv_python):
+        os.environ["VENV_ACTIVATED"] = "1"
+        os.execv(venv_python, [venv_python, __file__] + sys.argv[1:])
 
 import datetime
 import json
@@ -251,6 +258,22 @@ def check_alerts_for_signal(alert_file: Path, lookback_days: int = 14) -> dict:
 
 def run() -> int:
     log("=== WEEKLY CRON EVALUATION ===")
+    # --- DEDUP: if another instance ran in the last 50 min, skip ---
+    state_dir = Path(__file__).parent.parent / ".cron_output"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    finished_file = state_dir / "cron_evaluation.finished"
+    if finished_file.exists():
+        try:
+            age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(finished_file.stat().st_mtime)).total_seconds()
+            if age < 3000:  # 50 minutes
+                log(f"Skipping — last run was {age/60:.0f} minutes ago")
+                return 0
+        except Exception:
+            pass
+    # Mark that we're running
+    running_file = state_dir / "cron_evaluation.running"
+    running_file.write_text(datetime.datetime.now().isoformat())
+
     now = datetime.datetime.utcnow()
     prev_state = load_json(STATE_FILE, {"last_evaluation": None, "deprecation_log": []})
     report = {
@@ -449,6 +472,13 @@ def run() -> int:
     save_json(ALERT_FILE, alerts)
 
     log(f"Evaluation complete — {len(report['recommendations'])} recommendations, {len(report['new_jobs_suggested'])} new jobs suggested")
+
+    # Cleanup: rename running → finished
+    try:
+        running_file.unlink(missing_ok=True)
+        finished_file.write_text(datetime.datetime.now().isoformat())
+    except Exception:
+        pass
 
     return 1 if any_changes else 0
 

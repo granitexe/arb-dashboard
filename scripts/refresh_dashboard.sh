@@ -19,6 +19,15 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRON_OUT="$REPO_DIR/.cron_output"
 cd "$REPO_DIR"
 
+# Find the venv Python so cron jobs work regardless of environment
+if [ -f "$REPO_DIR/.venv/bin/python3" ]; then
+    PYTHON="$REPO_DIR/.venv/bin/python3"
+elif command -v python3 &>/dev/null; then
+    PYTHON="python3"
+else
+    PYTHON="/usr/bin/python3"
+fi
+
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 DASHBOARD_REPO="${DASHBOARD_REPO:-granitexe/arb-dashboard}"
 DASHBOARD_BRANCH="${DASHBOARD_BRANCH:-main}"
@@ -62,7 +71,7 @@ if [[ ! -d "$TMPDIR" ]] || [[ ! -f "$TMPDIR/index.html" ]]; then
 fi
 
 # --- generate HTML from signals.json using Python ---
-python3 - <<PYEOF
+$PYTHON - <<PYEOF
 import json, sys, datetime, os, textwrap
 from pathlib import Path
 

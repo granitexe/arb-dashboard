@@ -313,8 +313,12 @@ def _omp_coding(task: str, branch: str) -> tuple[bool, str]:
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
+    # Use login shell to source ~/.hermes/.env (API keys) before calling omp
+    # omp binary is ~/.local/bin/omp; use -p for non-interactive mode
+    omp_bin = str(Path.home() / ".local" / "bin" / "omp")
     rc, out, err = run_cmd(
-        ["bash", "-c", f"cd {ROOT} && git checkout -b {branch} 2>/dev/null || git checkout {branch} && omp.sh < {prompt_file}"],
+        ["bash", "-lc",
+         f"source ~/.hermes/.env 2>/dev/null; cd {ROOT} && git checkout -b {branch} 2>/dev/null || git checkout {branch} && {omp_bin} -p < {prompt_file}"],
         timeout=600,
     )
     prompt_file.unlink(missing_ok=True)
