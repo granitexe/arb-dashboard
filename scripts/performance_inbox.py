@@ -267,7 +267,7 @@ def run() -> int:
     log("Starting performance inbox parser")
     prev_state = load_state()
     entries = load_journal()
-    snapshot, alerts = compute_health(entries, prev_state)
+    snapshot, alerts, no_data = compute_health(entries, prev_state)
 
     # Update history
     history = prev_state.get("history", [])
@@ -278,22 +278,36 @@ def run() -> int:
         **prev_state,
         "history": history,
         "peak_equity": snapshot.get("peak_equity", prev_state.get("peak_equity", 0.0)),
-        "peak_equity_ts": peak_ts if (peak_ts := snapshot.get("peak_equity_ts")) else prev_state.get("peak_equity_ts"),
+        "peak_equity_ts": snapshot.get("peak_equity_ts") or prev_state.get("peak_equity_ts"),
+        "bankroll_usd": snapshot.get("current_equity", prev_state.get("bankroll_usd", 10000.0)),
     }
     save_state(new_state)
 
     HEALTH_FILE.write_text(json.dumps(snapshot, indent=2, default=str))
     ALERT_FILE.write_text(json.dumps(alerts, indent=2, default=str))
 
+    if no_data:
+        log("NO DATA YET — no live trades recorded; dry_run signals do not affect health")
+        print("=== HEALTH SNAPSHOT ===")
+        print(json.dumps(snapshot, indent=2, default=str))
+        return 0
+
     if alerts:
         for a in alerts:
             log(f"ALERT: [{a['type']}] {a.get('note', '')}")
-        log(f"Health score: {snapshot['health_score']}/100")
+        score = snapshot.get("health_score", "N/A")
+        log(f"Health score: {score}/100")
         return 1
     else:
-        log(f"OK: score={snapshot['health_score']}/100 | pnl=${snapshot['total_pnl_usd']} | "
-            f"win_rate={pct(snapshot['win_rate']) if snapshot['win_rate'] else 'N/A'} | "
-            f"open={snapshot['open_positions']} | carry=${snapshot['total_funding_collected_usd']}")
+        score = snapshot.get("health_score", 0)
+        pnl = snapshot.get("total_pnl_usd", 0)
+        wr = snapshot.get("win_rate")
+        open_pos = snapshot.get("open_positions", 0)
+        carry = snapshot.get("total_funding_collected_usd", 0)
+        log(f"OK: score={score}/100 | pnl=${pnl} | win_rate={pct(wr) if wr else 'N/A'} | "
+            f"open={open_pos} | carry=${carry}")
+        print("=== HEALTH SNAPSHOT ===")
+        print(json.dumps(snapshot, indent=2, default=str))
         return 0
 
 
