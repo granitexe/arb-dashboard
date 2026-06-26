@@ -74,11 +74,312 @@ def pct(v: float) -> str:
     return f"{v*100:.2f}%"
 
 
+def _is_schema_a(entry: dict) -> bool:
+    """Return True if entry has the enriched Schema A fields (pnl_usd etc.).
+
+    Schema A is produced by a live-trader that writes enriched entries with
+    realized P&L, funding collected, and explicit open/closed status.
+    Schema B (TradeJournalEntry.to_dict()) has action/size_executed but no pnl_usd.
+    """
+    return "pnl_usd" in entry or "funding_collected_usd" in entry or entry.get("status") in ("open", "closed")
+
+
+def _is_real_trade(entry: dict) -> bool:
+    """Return True if this entry represents a real executed trade, not a dry_run or skip."""
+    status = entry.get("status", "")
+    if status == "dry_run":
+        return False
+    # Schema B: real trades have action=OPEN and status=ok with non-zero size
+    if status == "ok" and entry.get("action") == "OPEN" and (entry.get("size_executed") or 0) > 0:
+        return True
+    # Schema A: any entry with status=ok and size_executed>0
+    if status == "ok" and (entry.get("size_executed") or 0) > 0:
+        return True
+    return False
+
+
+def _schema_a_compute(entries: list[dict]) -> tuple[dict, list[dict], bool]:
+    """Compute health for Schema A (enriched P&L entries with open/closed status)."""
+    alerts = []
+    total_pnl = 0.0
+    total_funding_collected = 0.0
+    wins = 0
+    losses = 0
+    adl_forced = 0
+    open_positions = []
+    no_data = True
+
+    for e in entries:
+        pnl = e.get("pnl_usd", 0.0) or 0.0
+        funding = e.get("funding_collected_usd", 0.0) or 0.0
+        status = e.get("status", "")
+        exit_reason = e.get("exit_reason", "")
+
+        if status in ("open", "closed"):
+            no_data = False
+
+        if status == "open":
+            open_positions.append(e)
+            total_pnl += pnl
+            total_funding_collected += funding
+        elif status == "closed":
+            total_pnl += pnl
+            total_funding_collected += funding
+            if pnl >= 0:
+                wins += 1
+            else:
+                losses += 1
+            if exit_reason == "ADL":
+                adl_forced += 1
+
+    return _build_snapshot(
+        entries=entries, wins=wins, losses=losses, adl_forced=adl_forced,
+        total_pnl=total_pnl, total_funding_collected=total_funding_collected,
+        open_positions=open_positions, no_data=no_data,
+    )
+
+
+def _schema_b_compute(entries: list[dict]) -> tuple[dict, list[dict], bool]:
+    """Compute health for Schema B (TradeJournalEntry.to_dict() action-based journal).
+
+    Schema B has no P&L or exit_reason fields. We infer health from:
+    - Win/loss: matched OPEN→CLOSE pairs via coin+direction
+    - ADL: entries where reason contains "ADL"
+    - Open carry: live fetch from Hyperliquid API
+    - P&L: inferred from bankroll_usd delta between cycles
+    """
+    alerts = []
+    no_data = True
+
+    # Separate dry_run from real trades
+    real_entries = [e for e in entries if _is_real_trade(e)]
+    dry_run_count = sum(1 for e in entries if e.get("status") == "dry_run")
+
+    if not real_entries:
+        # Only dry runs — informational only
+        return _build_snapshot(
+            entries=entries, wins=0, losses=0, adl_forced=0,
+            total_pnl=0.0, total_funding_collected=0.0,
+            open_positions=[], no_data=True,
+        )
+
+    no_data = False
+
+    # Match OPEN→CLOSE pairs by coin to determine wins/losses
+    # We track in-flight opens and look for corresponding CLOSE actions
+    open_by_coin: dict[str, dict] = {}
+    closed_trades = []
+    adl_forced = 0
+
+    for e in entries:
+        action = e.get("action", "")
+        coin = e.get("coin", "")
+        reason = e.get("reason", "")
+
+        if action == "OPEN" and _is_real_trade(e):
+            open_by_coin[coin] = e
+        elif action == "CLOSE" and _is_real_trade(e):
+            if coin in open_by_coin:
+                open_entry = open_by_coin.pop(coin)
+                closed_trades.append({"open": open_entry, "close": e})
+                if "ADL" in reason.upper():
+                    adl_forced += 1
+
+    wins = 0
+    losses = 0
+    total_pnl = 0.0
+
+    # Estimate P&L from bankroll_usd delta recorded in entries
+    # The executor records bankroll_usd at each action. Use last-seen bankroll
+    # as equity proxy; compare to initial bankroll in state.
+    bankroll_values = [e.get("bankroll_usd", 0) for e in entries if e.get("bankroll_usd")]
+    if bankroll_values:
+        latest_bankroll = bankroll_values[-1]
+        initial_bankroll = bankroll_values[0] if bankroll_values else 10000.0
+        total_pnl = latest_bankroll - initial_bankroll
+
+    # Funding collected: sum net_carry_apr * notional * duration
+    # Since we don't have duration, report as "estimated carry earned"
+    total_funding_collected = 0.0
+
+    # Open positions: live fetch from Hyperliquid (only if enabled)
+    open_positions = _fetch_live_positions()
+
+    # Classify wins/losses from closed trades
+    # P&L is bundled in bankroll delta; for per-trade classification use reason
+    for pair in closed_trades:
+        close_entry = pair["close"]
+        reason = close_entry.get("reason", "")
+        if "profit" in reason.lower() or "gain" in reason.lower() or "close" in reason.lower():
+            # Assume basis converged (good) unless ADL
+            if "ADL" not in reason.upper():
+                wins += 1
+            else:
+                losses += 1  # ADL is a forced loss
+        else:
+            losses += 1
+
+    # If we can't classify, use total_pnl sign
+    if closed_trades and wins + losses == 0:
+        if total_pnl >= 0:
+            wins = len(closed_trades)
+        else:
+            losses = len(closed_trades)
+
+    return _build_snapshot(
+        entries=entries, wins=wins, losses=losses, adl_forced=adl_forced,
+        total_pnl=total_pnl, total_funding_collected=total_funding_collected,
+        open_positions=open_positions, no_data=no_data,
+    )
+
+
+def _fetch_live_positions() -> list[dict]:
+    """Fetch current open positions from Hyperliquid if enabled.
+
+    Returns a list of position dicts with est_annual_carry and notional_usd.
+    """
+    try:
+        cfg_env = os.environ.get("HYPERLIQUID_ENABLED", "").lower()
+        if cfg_env != "true":
+            return []
+
+        # Import here to avoid hard dependency when HL is not configured
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from basis_arb.executor import get_open_positions
+        positions = get_open_positions()
+        enriched = []
+        for p in positions:
+            notional = abs(float(p.get("szi", 0) or 0) * float(p.get("lastPrice", 0) or 0))
+            # Carry estimated from funding rate stored in entry metadata if available
+            carry_apr = float(p.get("funding_apr", 0) or 0)
+            enriched.append({
+                "coin": p.get("coin", ""),
+                "notional_usd": notional,
+                "est_annual_carry": notional * carry_apr if carry_apr else 0.0,
+                "entry": p,
+            })
+        return enriched
+    except Exception as e:
+        log(f"Could not fetch live positions from Hyperliquid: {e}")
+        return []
+
+
+def _build_snapshot(
+    entries: list[dict],
+    wins: int,
+    losses: int,
+    adl_forced: int,
+    total_pnl: float,
+    total_funding_collected: float,
+    open_positions: list[dict],
+    no_data: bool,
+) -> tuple[dict, list[dict], bool]:
+    """Build the health snapshot dict and alerts from computed metrics."""
+    alerts = []
+    total_trades = wins + losses
+    win_rate = wins / total_trades if total_trades > 0 else None
+
+    # Load previous state for peak tracking
+    prev_state = load_state()
+    peak_equity = prev_state.get("peak_equity", 0.0)
+    peak_ts = prev_state.get("peak_equity_ts")
+    bankroll = prev_state.get("bankroll_usd", 10000.0)
+
+    # Drawdown detection
+    current_equity = bankroll + total_pnl
+    if current_equity > peak_equity:
+        peak_equity = current_equity
+        peak_ts = datetime.datetime.utcnow().isoformat()
+
+    drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
+
+    # Health score (0-100)
+    score = 50  # baseline
+    if win_rate is not None:
+        score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
+    if drawdown < 0.05:
+        score += 20
+    elif drawdown < 0.10:
+        score += 10
+    elif drawdown >= 0.15:
+        score -= 30
+        alerts.append({
+            "type": "HIGH_DRAWDOWN",
+            "drawdown_pct": pct(drawdown),
+            "peak_equity": round(peak_equity, 2),
+            "current_equity": round(current_equity, 2),
+            "note": "Drawdown >15% — review strategy",
+        })
+    if adl_forced > 0:
+        score -= adl_forced * 5
+        alerts.append({
+            "type": "ADL_FORCED",
+            "count": adl_forced,
+            "note": "Positions forced-closed by ADL — check over-leveraging",
+        })
+    score = max(0, min(100, score))
+
+    # Aggregate carry on open positions
+    open_carry = sum(e.get("est_annual_carry", 0.0) if isinstance(e, dict) else 0.0 for e in open_positions)
+    open_notional = sum(e.get("notional_usd", 0.0) if isinstance(e, dict) else 0.0 for e in open_positions)
+
+    snapshot = {
+        "ts": datetime.datetime.utcnow().isoformat(),
+        "total_pnl_usd": round(total_pnl, 2),
+        "total_funding_collected_usd": round(total_funding_collected, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "adl_forced": adl_forced,
+        "open_positions": len(open_positions),
+        "open_carry_annual_usd": round(open_carry, 2),
+        "open_notional_usd": round(open_notional, 2),
+        "current_equity": round(current_equity, 2),
+        "peak_equity": round(peak_equity, 2),
+        "peak_equity_ts": peak_ts,
+        "drawdown_pct": round(drawdown, 4),
+        "health_score": score,
+        "version_tag": prev_state.get("version_tag", "unknown"),
+    }
+
+    # Check kill-switch threshold
+    kill_switch_frac = float(os.environ.get("KILL_SWITCH_DRAWDOWN_FRAC", "0.15"))
+    if drawdown >= kill_switch_frac:
+        alerts.append({
+            "type": "KILL_SWITCH_NEAR",
+            "drawdown_pct": pct(drawdown),
+            "kill_switch_frac": pct(kill_switch_frac),
+            "note": f"Drawdown within 1% of kill-switch threshold",
+        })
+
+    return snapshot, alerts, no_data
+
+
 def load_journal() -> list[dict]:
-    """Load trade journal from one of the configured sources."""
+    """Load trade journal from one of the configured sources.
+
+    Priority (highest to lowest):
+      0. Project-local .trade_journal.jsonl (same repo, written by local trader)
+      1. ~/.basis_arb/trade_journal.jsonl  (shared volume mount)
+      2. TRADEFEED_URL env var             (webhook / REST endpoint)
+      3. GitHub API (granitexe/arb-dashboard) if GITHUB_TOKEN is set
+    """
     entries = []
 
-    # Source 1: local file
+    # Source 0: project-local file (written by trader on the same machine)
+    project_journal = Path(__file__).parent.parent / ".trade_journal.jsonl"
+    if project_journal.exists():
+        try:
+            for line in project_journal.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+            log(f"Loaded {len(entries)} entries from {project_journal}")
+            return entries
+        except Exception as e:
+            log(f"ERROR reading {project_journal}: {e}")
+
+    # Source 1: shared-volume local file
     if TRADER_INBOX.exists():
         try:
             for line in TRADER_INBOX.read_text().splitlines():
@@ -143,124 +444,23 @@ def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[di
     Returns (snapshot, alerts, no_data_flag).
     no_data_flag is True when there are no closed trades — health score is based
     on dry-run-only history and is informational, not actionable.
+
+    Handles two schemas:
+    - Schema A (enriched): entries with pnl_usd / funding_collected_usd / status in (open, closed)
+    - Schema B (TradeJournalEntry): action-based entries with no P&L fields
     """
     if not entries:
         return {"note": "No trade data available"}, [], True
 
-    alerts = []
-    total_pnl = 0.0
-    total_funding_collected = 0.0
-    wins = 0
-    losses = 0
-    adl_forced = 0
-    open_positions = []
-    peak_equity = prev_state.get("peak_equity", 0.0)
-    peak_ts = prev_state.get("peak_equity_ts")
-    bankroll = prev_state.get("bankroll_usd", 10000.0)
-    no_data = True  # flip to False once we see a real closed trade
+    # Detect schema from first non-empty entry
+    schema_a = _is_schema_a(entries[0]) if entries else False
 
-    for e in entries:
-        # Schema A (preferred): executor TradeJournalEntry with pnl_usd / funding_collected_usd
-        pnl = e.get("pnl_usd", 0.0) or 0.0
-        funding = e.get("funding_collected_usd", 0.0) or 0.0
-        status = e.get("status", "")
-        exit_reason = e.get("exit_reason", "")
-
-        # Schema B (fallback): executor raw journal — action-based, no P&L fields.
-        # Dry runs have status="dry_run" and size_executed=0. Only real "OPEN" actions
-        # with status="ok" and size_executed>0 count as live trades.
-        if status == "dry_run":
-            # No realized data yet — informational only
-            total_pnl += 0.0
-            total_funding_collected += 0.0
-        elif pnl != 0.0 or funding != 0.0 or status in ("closed", "open"):
-            # Enriched entry with P&L data present
-            no_data = False
-            total_pnl += pnl
-            total_funding_collected += funding
-
-            if status == "closed":
-                no_data = False
-                if pnl >= 0:
-                    wins += 1
-                else:
-                    losses += 1
-                if exit_reason == "ADL":
-                    adl_forced += 1
-            elif status == "open":
-                no_data = False
-                open_positions.append(e)
-
-    total_trades = wins + losses
-    win_rate = wins / total_trades if total_trades > 0 else None
-
-    # Drawdown detection
-    current_equity = bankroll + total_pnl
-    if current_equity > peak_equity:
-        peak_equity = current_equity
-        peak_ts = datetime.datetime.utcnow().isoformat()
-
-    drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
-
-    # Health score (0-100)
-    score = 50  # baseline
-    if win_rate is not None:
-        score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
-    if drawdown < 0.05:
-        score += 20
-    elif drawdown < 0.10:
-        score += 10
-    elif drawdown >= 0.15:
-        score -= 30
-        alerts.append({
-            "type": "HIGH_DRAWDOWN",
-            "drawdown_pct": pct(drawdown),
-            "peak_equity": peak_equity,
-            "current_equity": current_equity,
-            "note": "Drawdown >15% — review strategy",
-        })
-    if adl_forced > 0:
-        score -= adl_forced * 5
-        alerts.append({
-            "type": "ADL_FORCED",
-            "count": adl_forced,
-            "note": "Positions forced-closed by ADL — check over-leveraging",
-        })
-    score = max(0, min(100, score))
-
-    # Aggregate carry on open positions
-    open_carry = sum(e.get("est_annual_carry", 0.0) for e in open_positions)
-    open_notional = sum(e.get("notional_usd", 0.0) for e in open_positions)
-
-    snapshot = {
-        "ts": datetime.datetime.utcnow().isoformat(),
-        "total_pnl_usd": round(total_pnl, 2),
-        "total_funding_collected_usd": round(total_funding_collected, 2),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "adl_forced": adl_forced,
-        "open_positions": len(open_positions),
-        "open_carry_annual_usd": round(open_carry, 2),
-        "open_notional_usd": round(open_notional, 2),
-        "current_equity": round(current_equity, 2),
-        "peak_equity": round(peak_equity, 2),
-        "drawdown_pct": round(drawdown, 4),
-        "health_score": score,
-        "version_tag": prev_state.get("version_tag", "unknown"),
-    }
-
-    # Check kill-switch threshold
-    kill_switch_frac = float(os.environ.get("KILL_SWITCH_DRAWDOWN_FRAC", "0.15"))
-    if drawdown >= kill_switch_frac:
-        alerts.append({
-            "type": "KILL_SWITCH_NEAR",
-            "drawdown_pct": pct(drawdown),
-            "kill_switch_frac": pct(kill_switch_frac),
-            "note": f"Drawdown within 1% of kill-switch threshold",
-        })
-
-    return snapshot, alerts, no_data
+    if schema_a:
+        log("Detected Schema A (enriched P&L entries)")
+        return _schema_a_compute(entries)
+    else:
+        log("Detected Schema B (TradeJournalEntry action-based journal)")
+        return _schema_b_compute(entries)
 
 
 def run() -> int:
