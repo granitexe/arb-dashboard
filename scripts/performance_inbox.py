@@ -198,9 +198,23 @@ def _schema_b_compute(entries: list[dict]) -> tuple[dict, list[dict], bool]:
         initial_bankroll = bankroll_values[0] if bankroll_values else 10000.0
         total_pnl = latest_bankroll - initial_bankroll
 
-    # Funding collected: sum net_carry_apr * notional * duration
-    # Since we don't have duration, report as "estimated carry earned"
+    # Estimate carry earned from net_carry_apr × notional × elapsed time.
+    # For each matched pair, compute elapsed hours and accumulate carry.
+    # net_carry_apr is annual; divide by 8766 to get hourly rate.
     total_funding_collected = 0.0
+    for pair in closed_trades:
+        open_e = pair["open"]
+        close_e = pair["close"]
+        try:
+            ts_open = datetime.datetime.fromisoformat(open_e["timestamp"].replace("Z", "+00:00"))
+            ts_close = datetime.datetime.fromisoformat(close_e["timestamp"].replace("Z", "+00:00"))
+            elapsed_hours = max((ts_close - ts_open).total_seconds() / 3600, 0)
+        except Exception:
+            elapsed_hours = 0
+        notional = abs(open_e.get("size_executed", 0) or 0)
+        carry_apr = open_e.get("net_carry_apr", 0) or 0
+        carry_hourly = carry_apr / 8766
+        total_funding_collected += carry_hourly * notional * elapsed_hours
 
     # Open positions: live fetch from Hyperliquid (only if enabled)
     open_positions = _fetch_live_positions()
@@ -294,7 +308,10 @@ def _build_snapshot(
     drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
 
     # Health score (0-100)
-    score = 50  # baseline
+    # Baseline is 50. When no closed trades exist (win_rate is None),
+    # we only apply the drawdown component — the win-rate bonus is
+    # suppressed so a brand-new trader doesn't artificially inflate to 70.
+    score = 50
     if win_rate is not None:
         score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
     if drawdown < 0.05:
@@ -355,7 +372,7 @@ def _build_snapshot(
     return snapshot, alerts, no_data
 
 
-def load_journal() -> list[dict]:
+def load_journal() -> tuple[list[dict], str]:
     """Load trade journal from one of the configured sources.
 
     Priority (highest to lowest):
@@ -363,8 +380,11 @@ def load_journal() -> list[dict]:
       1. ~/.basis_arb/trade_journal.jsonl  (shared volume mount)
       2. TRADEFEED_URL env var             (webhook / REST endpoint)
       3. GitHub API (granitexe/arb-dashboard) if GITHUB_TOKEN is set
+
+    Returns (entries, source_label).
     """
     entries = []
+    source = "none"
 
     # Source 0: project-local file (written by trader on the same machine)
     project_journal = Path(__file__).parent.parent / ".trade_journal.jsonl"
@@ -375,7 +395,7 @@ def load_journal() -> list[dict]:
                 if line:
                     entries.append(json.loads(line))
             log(f"Loaded {len(entries)} entries from {project_journal}")
-            return entries
+            return entries, "local_project"
         except Exception as e:
             log(f"ERROR reading {project_journal}: {e}")
 
@@ -387,7 +407,7 @@ def load_journal() -> list[dict]:
                 if line:
                     entries.append(json.loads(line))
             log(f"Loaded {len(entries)} entries from {TRADER_INBOX}")
-            return entries
+            return entries, "shared_volume"
         except Exception as e:
             log(f"ERROR reading {TRADER_INBOX}: {e}")
 
@@ -406,7 +426,7 @@ def load_journal() -> list[dict]:
                 elif isinstance(data, dict) and "trades" in data:
                     entries = data["trades"]
             log(f"Loaded {len(entries)} entries from {feed_url}")
-            return entries
+            return entries, "tradefeed_url"
         except Exception as e:
             log(f"ERROR fetching {feed_url}: {e}")
 
@@ -431,11 +451,11 @@ def load_journal() -> list[dict]:
                     if line:
                         entries.append(json.loads(line))
             log(f"Loaded {len(entries)} entries from GitHub")
-            return entries
+            return entries, "github"
         except Exception as e:
             log(f"ERROR fetching from GitHub: {e}")
 
-    return entries
+    return entries, source
 
 
 def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[dict], bool]:
@@ -466,13 +486,20 @@ def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[di
 def run() -> int:
     log("Starting performance inbox parser")
     prev_state = load_state()
-    entries = load_journal()
+    entries, journal_source = load_journal()
     snapshot, alerts, no_data = compute_health(entries, prev_state)
+
+    # Enrich snapshot with source and closed-trade count for observability
+    snapshot["journal_source"] = journal_source
+    snapshot["total_closed_trades"] = snapshot.get("wins", 0) + snapshot.get("losses", 0)
 
     # Update history
     history = prev_state.get("history", [])
     history.append(snapshot)
     history = history[-60:]  # keep 60 data points
+
+    # Carry forward version_tag so it appears in snapshots after the first run
+    version_tag = snapshot.get("version_tag") or prev_state.get("version_tag") or "unknown"
 
     new_state = {
         **prev_state,
@@ -480,6 +507,7 @@ def run() -> int:
         "peak_equity": snapshot.get("peak_equity", prev_state.get("peak_equity", 0.0)),
         "peak_equity_ts": snapshot.get("peak_equity_ts") or prev_state.get("peak_equity_ts"),
         "bankroll_usd": snapshot.get("current_equity", prev_state.get("bankroll_usd", 10000.0)),
+        "version_tag": version_tag,
     }
     save_state(new_state)
 
