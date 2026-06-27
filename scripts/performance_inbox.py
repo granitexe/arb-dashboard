@@ -4,9 +4,10 @@
 This is the LIVE TRADER FEEDBACK loop. The running trader (on the separate PC)
 writes its .trade_journal.jsonl to a shared location this script can read.
 Options (in order of priority):
-  1. Local path: ~/.basis_arb/trade_journal.jsonl (same machine)
-  2. HTTP GET URL: TRADEFEED_URL env var (e.g. a webhook endpoint the trader pushes to)
-  3. GitHub API: read from arb-dashboard repo if GITHUB_TOKEN is set
+  1. Local path: project-local .trade_journal.jsonl (same repo)
+  2. ~/.basis_arb/trade_journal.jsonl  (shared volume mount)
+  3. HTTP GET URL: TRADEFEED_URL env var (e.g. a webhook endpoint the trader pushes to)
+  4. GitHub API: read from granitexe/arb-dashboard repo if GITHUB_TOKEN is set
 
 The script computes:
   - Total P&L vs bankroll
@@ -74,11 +75,313 @@ def pct(v: float) -> str:
     return f"{v*100:.2f}%"
 
 
-def load_journal() -> list[dict]:
-    """Load trade journal from one of the configured sources."""
-    entries = []
+def _is_schema_a(entry: dict) -> bool:
+    """Return True if entry has the enriched Schema A fields (pnl_usd etc.).
 
-    # Source 1: local file
+    Schema A is produced by a live-trader that writes enriched entries with
+    realized P&L, funding collected, and explicit open/closed status.
+    Schema B (TradeJournalEntry.to_dict()) has action/size_executed but no pnl_usd.
+    """
+    return (
+        "pnl_usd" in entry
+        or "funding_collected_usd" in entry
+        or entry.get("status") in ("open", "closed")
+    )
+
+
+def _is_real_trade(entry: dict) -> bool:
+    """Return True if this entry represents a real executed trade, not a dry_run or skip."""
+    status = entry.get("status", "")
+    if status == "dry_run":
+        return False
+    # Schema B: real trades have action=OPEN and status=ok with non-zero size
+    if status == "ok" and entry.get("action") == "OPEN" and (entry.get("size_executed") or 0) > 0:
+        return True
+    # Schema A: any entry with status=ok and size_executed>0
+    if status == "ok" and (entry.get("size_executed") or 0) > 0:
+        return True
+    return False
+
+
+def _fetch_live_positions() -> list[dict]:
+    """Fetch current open positions from Hyperliquid if enabled.
+
+    Returns a list of position dicts with est_annual_carry and notional_usd.
+    """
+    try:
+        cfg_env = os.environ.get("HYPERLIQUID_ENABLED", "").lower()
+        if cfg_env != "true":
+            return []
+
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from basis_arb.executor import get_open_positions
+        positions = get_open_positions()
+        enriched = []
+        for p in positions:
+            notional = abs(float(p.get("szi", 0) or 0) * float(p.get("lastPrice", 0) or 0))
+            carry_apr = float(p.get("funding_apr", 0) or 0)
+            enriched.append({
+                "coin": p.get("coin", ""),
+                "notional_usd": notional,
+                "est_annual_carry": notional * carry_apr if carry_apr else 0.0,
+                "entry": p,
+            })
+        return enriched
+    except Exception as e:
+        log(f"Could not fetch live positions from Hyperliquid: {e}")
+        return []
+
+
+def _build_snapshot(
+    entries: list[dict],
+    wins: int,
+    losses: int,
+    adl_forced: int,
+    total_pnl: float,
+    total_funding_collected: float,
+    open_positions: list[dict],
+    no_data: bool,
+) -> tuple[dict, list[dict], bool]:
+    """Build the health snapshot dict and alerts from computed metrics."""
+    alerts = []
+    total_trades = wins + losses
+    win_rate = wins / total_trades if total_trades > 0 else None
+
+    prev_state = load_state()
+    peak_equity = prev_state.get("peak_equity", 0.0)
+    peak_ts = prev_state.get("peak_equity_ts")
+    bankroll = prev_state.get("bankroll_usd", 10000.0)
+
+    current_equity = bankroll + total_pnl
+    if current_equity > peak_equity:
+        peak_equity = current_equity
+        peak_ts = datetime.datetime.utcnow().isoformat()
+
+    drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
+
+    # Health score (0-100)
+    # Baseline 50. Win-rate bonus suppressed when no closed trades yet (no_data).
+    score = 50
+    if win_rate is not None:
+        score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
+    if drawdown < 0.05:
+        score += 20
+    elif drawdown < 0.10:
+        score += 10
+    elif drawdown >= 0.15:
+        score -= 30
+        alerts.append({
+            "type": "HIGH_DRAWDOWN",
+            "drawdown_pct": pct(drawdown),
+            "peak_equity": round(peak_equity, 2),
+            "current_equity": round(current_equity, 2),
+            "note": "Drawdown >15% — review strategy",
+        })
+    if adl_forced > 0:
+        score -= adl_forced * 5
+        alerts.append({
+            "type": "ADL_FORCED",
+            "count": adl_forced,
+            "note": "Positions forced-closed by ADL — check over-leveraging",
+        })
+    score = max(0, min(100, score))
+
+    open_carry = sum(
+        e.get("est_annual_carry", 0.0) if isinstance(e, dict) else 0.0
+        for e in open_positions
+    )
+    open_notional = sum(
+        e.get("notional_usd", 0.0) if isinstance(e, dict) else 0.0
+        for e in open_positions
+    )
+
+    snapshot = {
+        "ts": datetime.datetime.utcnow().isoformat(),
+        "total_pnl_usd": round(total_pnl, 2),
+        "total_funding_collected_usd": round(total_funding_collected, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "adl_forced": adl_forced,
+        "open_positions": len(open_positions),
+        "open_carry_annual_usd": round(open_carry, 2),
+        "open_notional_usd": round(open_notional, 2),
+        "current_equity": round(current_equity, 2),
+        "peak_equity": round(peak_equity, 2),
+        "peak_equity_ts": peak_ts,
+        "drawdown_pct": round(drawdown, 4),
+        "health_score": score,
+        "version_tag": prev_state.get("version_tag", "unknown"),
+    }
+
+    kill_switch_frac = float(os.environ.get("KILL_SWITCH_DRAWDOWN_FRAC", "0.15"))
+    if drawdown >= kill_switch_frac:
+        alerts.append({
+            "type": "KILL_SWITCH_NEAR",
+            "drawdown_pct": pct(drawdown),
+            "kill_switch_frac": pct(kill_switch_frac),
+            "note": f"Drawdown within 1% of kill-switch threshold",
+        })
+
+    return snapshot, alerts, no_data
+
+
+def _schema_a_compute(entries: list[dict]) -> tuple[dict, list[dict], bool]:
+    """Compute health for Schema A (enriched P&L entries with open/closed status)."""
+    total_pnl = 0.0
+    total_funding_collected = 0.0
+    wins = 0
+    losses = 0
+    adl_forced = 0
+    open_positions = []
+    no_data = True
+
+    for e in entries:
+        pnl = e.get("pnl_usd", 0.0) or 0.0
+        funding = e.get("funding_collected_usd", 0.0) or 0.0
+        status = e.get("status", "")
+        exit_reason = e.get("exit_reason", "")
+
+        if status in ("open", "closed"):
+            no_data = False
+
+        if status == "open":
+            open_positions.append(e)
+            total_pnl += pnl
+            total_funding_collected += funding
+        elif status == "closed":
+            total_pnl += pnl
+            total_funding_collected += funding
+            if pnl >= 0:
+                wins += 1
+            else:
+                losses += 1
+            if exit_reason == "ADL":
+                adl_forced += 1
+
+    return _build_snapshot(
+        entries=entries, wins=wins, losses=losses, adl_forced=adl_forced,
+        total_pnl=total_pnl, total_funding_collected=total_funding_collected,
+        open_positions=open_positions, no_data=no_data,
+    )
+
+
+def _schema_b_compute(entries: list[dict]) -> tuple[dict, list[dict], bool]:
+    """Compute health for Schema B (TradeJournalEntry action-based journal).
+
+    Schema B has no P&L or exit_reason fields. We infer health from:
+    - Win/loss: matched OPEN→CLOSE pairs via coin+direction
+    - ADL: entries where reason contains "ADL"
+    - Open carry: live fetch from Hyperliquid API
+    - P&L: inferred from bankroll_usd delta between cycles
+    """
+    real_entries = [e for e in entries if _is_real_trade(e)]
+    if not real_entries:
+        return _build_snapshot(
+            entries=entries, wins=0, losses=0, adl_forced=0,
+            total_pnl=0.0, total_funding_collected=0.0,
+            open_positions=[], no_data=True,
+        )
+
+    no_data = False
+
+    open_by_coin: dict[str, dict] = {}
+    closed_trades = []
+    adl_forced = 0
+
+    for e in entries:
+        action = e.get("action", "")
+        coin = e.get("coin", "")
+        reason = e.get("reason", "")
+
+        if action == "OPEN" and _is_real_trade(e):
+            open_by_coin[coin] = e
+        elif action == "CLOSE" and _is_real_trade(e):
+            if coin in open_by_coin:
+                open_entry = open_by_coin.pop(coin)
+                closed_trades.append({"open": open_entry, "close": e})
+                if "ADL" in reason.upper():
+                    adl_forced += 1
+
+    wins = 0
+    losses = 0
+    total_pnl = 0.0
+
+    bankroll_values = [e.get("bankroll_usd", 0) for e in entries if e.get("bankroll_usd")]
+    if bankroll_values:
+        latest_bankroll = bankroll_values[-1]
+        initial_bankroll = bankroll_values[0] if bankroll_values else 10000.0
+        total_pnl = latest_bankroll - initial_bankroll
+
+    total_funding_collected = 0.0
+    for pair in closed_trades:
+        open_e = pair["open"]
+        close_e = pair["close"]
+        try:
+            ts_open = datetime.datetime.fromisoformat(open_e["timestamp"].replace("Z", "+00:00"))
+            ts_close = datetime.datetime.fromisoformat(close_e["timestamp"].replace("Z", "+00:00"))
+            elapsed_hours = max((ts_close - ts_open).total_seconds() / 3600, 0)
+        except Exception:
+            elapsed_hours = 0
+        notional = abs(open_e.get("size_executed", 0) or 0)
+        carry_apr = open_e.get("net_carry_apr", 0) or 0
+        carry_hourly = carry_apr / 8766
+        total_funding_collected += carry_hourly * notional * elapsed_hours
+
+    open_positions = _fetch_live_positions()
+
+    for pair in closed_trades:
+        close_entry = pair["close"]
+        reason = close_entry.get("reason", "")
+        if "profit" in reason.lower() or "gain" in reason.lower() or "close" in reason.lower():
+            if "ADL" not in reason.upper():
+                wins += 1
+            else:
+                losses += 1
+        else:
+            losses += 1
+
+    if closed_trades and wins + losses == 0:
+        if total_pnl >= 0:
+            wins = len(closed_trades)
+        else:
+            losses = len(closed_trades)
+
+    return _build_snapshot(
+        entries=entries, wins=wins, losses=losses, adl_forced=adl_forced,
+        total_pnl=total_pnl, total_funding_collected=total_funding_collected,
+        open_positions=open_positions, no_data=no_data,
+    )
+
+
+def load_journal() -> tuple[list[dict], str]:
+    """Load trade journal from one of the configured sources.
+
+    Priority (highest to lowest):
+      0. Project-local .trade_journal.jsonl (same repo, written by local trader)
+      1. ~/.basis_arb/trade_journal.jsonl  (shared volume mount)
+      2. TRADEFEED_URL env var             (webhook / REST endpoint)
+      3. GitHub API (granitexe/arb-dashboard) if GITHUB_TOKEN is set
+
+    Returns (entries, source_label).
+    """
+    entries = []
+    source = "none"
+
+    # Source 0: project-local file (written by trader on the same machine)
+    project_journal = Path(__file__).parent.parent / ".trade_journal.jsonl"
+    if project_journal.exists():
+        try:
+            for line in project_journal.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+            log(f"Loaded {len(entries)} entries from {project_journal}")
+            return entries, "local_project"
+        except Exception as e:
+            log(f"ERROR reading {project_journal}: {e}")
+
+    # Source 1: shared-volume local file
     if TRADER_INBOX.exists():
         try:
             for line in TRADER_INBOX.read_text().splitlines():
@@ -86,7 +389,7 @@ def load_journal() -> list[dict]:
                 if line:
                     entries.append(json.loads(line))
             log(f"Loaded {len(entries)} entries from {TRADER_INBOX}")
-            return entries
+            return entries, "shared_volume"
         except Exception as e:
             log(f"ERROR reading {TRADER_INBOX}: {e}")
 
@@ -105,7 +408,7 @@ def load_journal() -> list[dict]:
                 elif isinstance(data, dict) and "trades" in data:
                     entries = data["trades"]
             log(f"Loaded {len(entries)} entries from {feed_url}")
-            return entries
+            return entries, "tradefeed_url"
         except Exception as e:
             log(f"ERROR fetching {feed_url}: {e}")
 
@@ -113,8 +416,6 @@ def load_journal() -> list[dict]:
     token = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN_RO", "")
     if token:
         try:
-            from urllib.parse import urlparse
-            # Construct raw URL for trade_journal.jsonl in arb-dashboard repo
             api_url = (
                 "https://api.github.com/repos/granitexe/arb-dashboard/"
                 "contents/trade_journal.jsonl"
@@ -130,170 +431,89 @@ def load_journal() -> list[dict]:
                     if line:
                         entries.append(json.loads(line))
             log(f"Loaded {len(entries)} entries from GitHub")
-            return entries
+            return entries, "github"
         except Exception as e:
             log(f"ERROR fetching from GitHub: {e}")
 
-    return entries
+    return entries, source
 
 
 def compute_health(entries: list[dict], prev_state: dict) -> tuple[dict, list[dict], bool]:
     """Compute health metrics from trade journal entries.
 
     Returns (snapshot, alerts, no_data_flag).
-    no_data_flag is True when there are no closed trades — health score is based
-    on dry-run-only history and is informational, not actionable.
+    no_data_flag is True when there are no closed trades — health score is
+    informational and based on dry-run-only history.
+
+    Handles two schemas:
+    - Schema A (enriched): entries with pnl_usd / funding_collected_usd / status in (open, closed)
+    - Schema B (TradeJournalEntry): action-based entries with no P&L fields
     """
     if not entries:
         return {"note": "No trade data available"}, [], True
 
-    alerts = []
-    total_pnl = 0.0
-    total_funding_collected = 0.0
-    wins = 0
-    losses = 0
-    adl_forced = 0
-    open_positions = []
-    peak_equity = prev_state.get("peak_equity", 0.0)
-    peak_ts = prev_state.get("peak_equity_ts")
-    bankroll = prev_state.get("bankroll_usd", 10000.0)
-    no_data = True  # flip to False once we see a real closed trade
+    schema_a = _is_schema_a(entries[0]) if entries else False
 
-    for e in entries:
-        # Schema A (preferred): executor TradeJournalEntry with pnl_usd / funding_collected_usd
-        pnl = e.get("pnl_usd", 0.0) or 0.0
-        funding = e.get("funding_collected_usd", 0.0) or 0.0
-        status = e.get("status", "")
-        exit_reason = e.get("exit_reason", "")
-
-        # Schema B (fallback): executor raw journal — action-based, no P&L fields.
-        # Dry runs have status="dry_run" and size_executed=0. Only real "OPEN" actions
-        # with status="ok" and size_executed>0 count as live trades.
-        if status == "dry_run":
-            # No realized data yet — informational only
-            total_pnl += 0.0
-            total_funding_collected += 0.0
-        elif pnl != 0.0 or funding != 0.0 or status in ("closed", "open"):
-            # Enriched entry with P&L data present
-            no_data = False
-            total_pnl += pnl
-            total_funding_collected += funding
-
-            if status == "closed":
-                no_data = False
-                if pnl >= 0:
-                    wins += 1
-                else:
-                    losses += 1
-                if exit_reason == "ADL":
-                    adl_forced += 1
-            elif status == "open":
-                no_data = False
-                open_positions.append(e)
-
-    total_trades = wins + losses
-    win_rate = wins / total_trades if total_trades > 0 else None
-
-    # Drawdown detection
-    current_equity = bankroll + total_pnl
-    if current_equity > peak_equity:
-        peak_equity = current_equity
-        peak_ts = datetime.datetime.utcnow().isoformat()
-
-    drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
-
-    # Health score (0-100)
-    score = 50  # baseline
-    if win_rate is not None:
-        score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
-    if drawdown < 0.05:
-        score += 20
-    elif drawdown < 0.10:
-        score += 10
-    elif drawdown >= 0.15:
-        score -= 30
-        alerts.append({
-            "type": "HIGH_DRAWDOWN",
-            "drawdown_pct": pct(drawdown),
-            "peak_equity": peak_equity,
-            "current_equity": current_equity,
-            "note": "Drawdown >15% — review strategy",
-        })
-    if adl_forced > 0:
-        score -= adl_forced * 5
-        alerts.append({
-            "type": "ADL_FORCED",
-            "count": adl_forced,
-            "note": "Positions forced-closed by ADL — check over-leveraging",
-        })
-    score = max(0, min(100, score))
-
-    # Aggregate carry on open positions
-    open_carry = sum(e.get("est_annual_carry", 0.0) for e in open_positions)
-    open_notional = sum(e.get("notional_usd", 0.0) for e in open_positions)
-
-    snapshot = {
-        "ts": datetime.datetime.utcnow().isoformat(),
-        "total_pnl_usd": round(total_pnl, 2),
-        "total_funding_collected_usd": round(total_funding_collected, 2),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "adl_forced": adl_forced,
-        "open_positions": len(open_positions),
-        "open_carry_annual_usd": round(open_carry, 2),
-        "open_notional_usd": round(open_notional, 2),
-        "current_equity": round(current_equity, 2),
-        "peak_equity": round(peak_equity, 2),
-        "drawdown_pct": round(drawdown, 4),
-        "health_score": score,
-        "version_tag": prev_state.get("version_tag", "unknown"),
-    }
-
-    # Check kill-switch threshold
-    kill_switch_frac = float(os.environ.get("KILL_SWITCH_DRAWDOWN_FRAC", "0.15"))
-    if drawdown >= kill_switch_frac:
-        alerts.append({
-            "type": "KILL_SWITCH_NEAR",
-            "drawdown_pct": pct(drawdown),
-            "kill_switch_frac": pct(kill_switch_frac),
-            "note": f"Drawdown within 1% of kill-switch threshold",
-        })
-
-    return snapshot, alerts, no_data
+    if schema_a:
+        log("Detected Schema A (enriched P&L entries)")
+        return _schema_a_compute(entries)
+    else:
+        log("Detected Schema B (TradeJournalEntry action-based journal)")
+        return _schema_b_compute(entries)
 
 
 def run() -> int:
     log("Starting performance inbox parser")
     prev_state = load_state()
-    entries = load_journal()
-    snapshot, alerts = compute_health(entries, prev_state)
+    entries, journal_source = load_journal()
+    snapshot, alerts, no_data = compute_health(entries, prev_state)
 
-    # Update history
+    snapshot["journal_source"] = journal_source
+    snapshot["total_closed_trades"] = snapshot.get("wins", 0) + snapshot.get("losses", 0)
+
     history = prev_state.get("history", [])
     history.append(snapshot)
     history = history[-60:]  # keep 60 data points
+
+    version_tag = snapshot.get("version_tag") or prev_state.get("version_tag") or "unknown"
 
     new_state = {
         **prev_state,
         "history": history,
         "peak_equity": snapshot.get("peak_equity", prev_state.get("peak_equity", 0.0)),
-        "peak_equity_ts": peak_ts if (peak_ts := snapshot.get("peak_equity_ts")) else prev_state.get("peak_equity_ts"),
+        "peak_equity_ts": snapshot.get("peak_equity_ts") or prev_state.get("peak_equity_ts"),
+        "bankroll_usd": snapshot.get("current_equity", prev_state.get("bankroll_usd", 10000.0)),
+        "version_tag": version_tag,
     }
     save_state(new_state)
 
     HEALTH_FILE.write_text(json.dumps(snapshot, indent=2, default=str))
     ALERT_FILE.write_text(json.dumps(alerts, indent=2, default=str))
 
+    if no_data:
+        log("NO DATA YET — no live trades recorded; dry_run signals do not affect health")
+        print("=== HEALTH SNAPSHOT ===")
+        print(json.dumps(snapshot, indent=2, default=str))
+        return 0
+
     if alerts:
         for a in alerts:
             log(f"ALERT: [{a['type']}] {a.get('note', '')}")
-        log(f"Health score: {snapshot['health_score']}/100")
+        score = snapshot.get("health_score", "N/A")
+        log(f"Health score: {score}/100")
+        print("=== HEALTH SNAPSHOT ===")
+        print(json.dumps(snapshot, indent=2, default=str))
         return 1
     else:
-        log(f"OK: score={snapshot['health_score']}/100 | pnl=${snapshot['total_pnl_usd']} | "
-            f"win_rate={pct(snapshot['win_rate']) if snapshot['win_rate'] else 'N/A'} | "
-            f"open={snapshot['open_positions']} | carry=${snapshot['total_funding_collected_usd']}")
+        score = snapshot.get("health_score", 0)
+        pnl = snapshot.get("total_pnl_usd", 0)
+        wr = snapshot.get("win_rate")
+        open_pos = snapshot.get("open_positions", 0)
+        carry = snapshot.get("total_funding_collected_usd", 0)
+        log(f"OK: score={score}/100 | pnl=${pnl} | win_rate={pct(wr) if wr else 'N/A'} | "
+            f"open={open_pos} | carry=${carry}")
+        print("=== HEALTH SNAPSHOT ===")
+        print(json.dumps(snapshot, indent=2, default=str))
         return 0
 
 
