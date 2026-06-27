@@ -345,6 +345,43 @@ def _check_cron_evaluation_needed() -> tuple[bool, str]:
     return False, f"cron evaluation ran {days_since} days ago"
 
 
+def _check_trade_evaluation_needed() -> tuple[bool, str]:
+    """Trade evaluator if signals.json exists and is fresh (<1h old)."""
+    signals_file = CRON_OUT / "signals.json"
+    if not signals_file.exists():
+        return False, "signals.json missing"
+    if _file_aged(signals_file, hours=1):
+        return True, "signals.json > 1h old"
+    # Also run if no trade_evaluations exist yet
+    evals_file = CRON_OUT / "trade_evaluations.jsonl"
+    if not evals_file.exists():
+        return True, "trade_evaluations.jsonl missing (first run)"
+    return False, "trade_evaluations fresh"
+
+
+def _check_risk_optimization_needed() -> tuple[bool, str]:
+    """Risk optimizer if trade evaluations exist and are fresh (<30min old)."""
+    evals_file = CRON_OUT / "trade_evaluations.jsonl"
+    if not evals_file.exists():
+        return False, "trade_evaluations.jsonl missing"
+    if _file_aged(evals_file, minutes=30):
+        return True, "trade_evaluations > 30min old"
+    # Always run after trade evaluator if GO signals exist
+    try:
+        lines = evals_file.read_text().strip().split("\n")
+        for line in lines:
+            try:
+                import json
+                eval_data = json.loads(line)
+                if eval_data.get("verdict") == "GO":
+                    return True, "GO signals found in trade_evaluations"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False, "no new GO signals"
+
+
 # ── job runners ─────────────────────────────────────────────────────────────
 
 def run_signal_pipeline() -> tuple[bool, str]:
@@ -365,6 +402,49 @@ def run_signal_pipeline() -> tuple[bool, str]:
     rc, out, err = run_cmd(["bash", str(script)], timeout=180)
     ok = rc == 0
     return ok, f"signal-pipeline rc={rc}: {err[:200] if err else out[:200]}"
+
+
+def run_trade_evaluator() -> tuple[bool, str]:
+    """Run trade_evaluator.py on the latest signals.json."""
+    script = SCRIPTS / "run_trade_evaluator.sh"
+    try:
+        from basis_arb import trade_evaluator
+        # Run directly as module — faster than subprocess
+        signals_file = CRON_OUT / "signals.json"
+        evals_file = CRON_OUT / "trade_evaluations.jsonl"
+        if not signals_file.exists():
+            return False, "signals.json missing"
+        results = trade_evaluator.load_evaluated_signals(str(signals_file))
+        # Write results
+        evals_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(evals_file, "w") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+        go_count = sum(1 for r in results if r.get("verdict") == "GO")
+        return True, f"trade_evaluator: {len(results)} evaluated, {go_count} GO"
+    except Exception as e:
+        return False, f"trade_evaluator failed: {e}"
+
+
+def run_risk_optimizer() -> tuple[bool, str]:
+    """Run risk_optimizer.py on the latest trade_evaluations.jsonl."""
+    script = SCRIPTS / "run_risk_optimizer.sh"
+    try:
+        from basis_arb import risk_optimizer
+        evals_file = CRON_OUT / "trade_evaluations.jsonl"
+        output_file = CRON_OUT / "portfolio_recommendation.json"
+        if not evals_file.exists():
+            return False, "trade_evaluations.jsonl missing"
+        optimizer = risk_optimizer.RiskOptimizer()
+        report = optimizer.run()
+        # Write output
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(json.dumps(report, indent=2))
+        action = report.get("action", "UNKNOWN")
+        notional = report.get("notional", 0)
+        return True, f"risk_optimizer: action={action}, notional=${notional:.0f}"
+    except Exception as e:
+        return False, f"risk_optimizer failed: {e}"
 
 
 def run_performance_inbox() -> tuple[bool, str]:
@@ -558,6 +638,22 @@ def decide_and_run() -> tuple[int, list]:
         # After signal pipeline, refresh dashboard
         ok3, msg3 = run_refresh_dashboard()
         actions_taken.append(f"refresh_dashboard: {msg3}")
+
+        # ── Trade evaluator + risk optimizer (feeds signal pipeline) ────────
+        needs_eval, reason = _check_trade_evaluation_needed()
+        if needs_eval:
+            log(f"Running trade_evaluator: {reason}")
+            ok4, msg4 = run_trade_evaluator()
+            actions_taken.append(f"trade_evaluator: {msg4}")
+            # If trade evaluator found GO signals, run risk optimizer
+            if ok4:
+                needs_opt, reason2 = _check_risk_optimization_needed()
+                if needs_opt:
+                    log(f"Running risk_optimizer: {reason2}")
+                    ok5, msg5 = run_risk_optimizer()
+                    actions_taken.append(f"risk_optimizer: {msg5}")
+                    if not ok5:
+                        alerts.append({"type": "RISK_OPTIMIZER_ERROR", "msg": msg5})
 
     # ── Performance inbox ──────────────────────────────────────────────────
     needs_perf, reason = _check_performance_stale()
