@@ -251,20 +251,26 @@ def _fetch_live_positions() -> list[dict]:
     """Fetch current open positions from Hyperliquid if enabled.
 
     Returns a list of position dicts with est_annual_carry and notional_usd.
+    Falls back to an empty list if executor is not available or HL is disabled.
     """
     try:
         cfg_env = os.environ.get("HYPERLIQUID_ENABLED", "").lower()
         if cfg_env != "true":
             return []
 
-        # Import here to avoid hard dependency when HL is not configured
+        # Import here to avoid hard dependency when HL is not configured.
+        # If executor module doesn't exist, get_open_positions won't be available.
         sys.path.insert(0, str(Path(__file__).parent.parent))
-        from basis_arb.executor import get_open_positions
+        try:
+            from basis_arb.executor import get_open_positions
+        except ImportError:
+            log("Hyperliquid enabled but basis_arb.executor not found — skipping live positions")
+            return []
+
         positions = get_open_positions()
         enriched = []
         for p in positions:
             notional = abs(float(p.get("szi", 0) or 0) * float(p.get("lastPrice", 0) or 0))
-            # Carry estimated from funding rate stored in entry metadata if available
             carry_apr = float(p.get("funding_apr", 0) or 0)
             enriched.append({
                 "coin": p.get("coin", ""),
@@ -309,24 +315,25 @@ def _build_snapshot(
 
     # Health score (0-100)
     # Baseline is 50. When no closed trades exist (win_rate is None),
-    # we only apply the drawdown component — the win-rate bonus is
-    # suppressed so a brand-new trader doesn't artificially inflate to 70.
+    # no closed-trade metrics apply — the score stays at baseline (50).
+    # This prevents a brand-new trader from artificially inflating to 70.
     score = 50
     if win_rate is not None:
         score += (win_rate - 0.5) * 40  # ±20 pts based on win rate
-    if drawdown < 0.05:
-        score += 20
-    elif drawdown < 0.10:
-        score += 10
-    elif drawdown >= 0.15:
-        score -= 30
-        alerts.append({
-            "type": "HIGH_DRAWDOWN",
-            "drawdown_pct": pct(drawdown),
-            "peak_equity": round(peak_equity, 2),
-            "current_equity": round(current_equity, 2),
-            "note": "Drawdown >15% — review strategy",
-        })
+        # Drawdown bonus only meaningful after we have closed-trade history
+        if drawdown < 0.05:
+            score += 20
+        elif drawdown < 0.10:
+            score += 10
+        elif drawdown >= 0.15:
+            score -= 30
+            alerts.append({
+                "type": "HIGH_DRAWDOWN",
+                "drawdown_pct": pct(drawdown),
+                "peak_equity": round(peak_equity, 2),
+                "current_equity": round(current_equity, 2),
+                "note": "Drawdown >15% — review strategy",
+            })
     if adl_forced > 0:
         score -= adl_forced * 5
         alerts.append({
